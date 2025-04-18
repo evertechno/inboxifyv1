@@ -1,151 +1,101 @@
 import streamlit as st
+from email_validator import validate_email, EmailNotValidError
+import dns.resolver
+import smtplib
 import pandas as pd
-import math
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Function to check email validity
+def validate_email_address(email, blacklist, custom_sender="test@example.com"):
+    """Enhanced email validation with DNS, SMTP, and blacklist checks."""
+    try:
+        # Step 1: Syntax validation
+        validate_email(email)
+    except EmailNotValidError as e:
+        return email, "Invalid", f"Invalid syntax: {str(e)}"
+    
+    domain = email.split("@")[-1]
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+    # Step 2: Blacklist check
+    if domain in blacklist:
+        return email, "Blacklisted", "Domain is blacklisted."
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+    # Step 3: DNS Validation
+    try:
+        mx_records = dns.resolver.resolve(domain, "MX")
+    except dns.resolver.NXDOMAIN:
+        return email, "Invalid", "Domain does not exist."
+    except dns.resolver.Timeout:
+        return email, "Invalid", "DNS query timed out."
+    except Exception as e:
+        return email, "Invalid", f"DNS error: {str(e)}"
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+    # Step 4: SMTP Validation
+    try:
+        mx_host = str(mx_records[0].exchange).rstrip(".")
+        smtp = smtplib.SMTP(mx_host, timeout=10)
+        smtp.helo()
+        smtp.mail(custom_sender)
+        code, _ = smtp.rcpt(email)
+        smtp.quit()
+        if code == 250:
+            return email, "Valid", "Email exists and is reachable."
+        elif code == 550:
+            return email, "Invalid", "Mailbox does not exist."
+        elif code == 451:
+            return email, "Greylisted", "Temporary error, try again later."
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            return email, "Invalid", f"SMTP response code {code}."
+    except smtplib.SMTPConnectError:
+        return email, "Invalid", "SMTP connection failed."
+    except Exception as e:
+        return email, "Invalid", f"SMTP error: {str(e)}"
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    return email, "Invalid", "Unknown error."
+
+# Streamlit App
+st.title("Inboxify by EverTech")
+
+# Additional Information
+st.write("""
+**For Inboxify Mobile App please visit [Amazon Appstore](https://www.amazon.com/gp/product/B0DV3S92JY)** 
+""")
+
+# Blacklist upload
+blacklist_file = st.file_uploader("Upload a blacklist file (optional)", type=["txt"])
+blacklist = set()
+if blacklist_file:
+    blacklist = set(line.strip() for line in blacklist_file.read().decode("utf-8").splitlines())
+    st.write(f"Loaded {len(blacklist)} blacklisted domains.")
+
+# File upload
+uploaded_file = st.file_uploader("Upload a .txt file with emails", type=["txt"])
+if uploaded_file:
+    emails = uploaded_file.read().decode("utf-8").splitlines()
+
+    st.write(f"Processing {len(emails)} emails...")
+
+    # Process emails
+    results = []
+    progress = st.progress(0)
+
+    with ThreadPoolExecutor(max_workers=50) as executor:  # Increase max workers to handle more emails
+        futures = [executor.submit(validate_email_address, email.strip(), blacklist) for email in emails if email.strip()]
+        for idx, future in enumerate(as_completed(futures)):
+            results.append(future.result())
+            progress.progress((idx + 1) / len(emails))
+
+    # Display results
+    df = pd.DataFrame(results, columns=["Email", "Status", "Message"])
+    st.dataframe(df)
+
+    # Summary report
+    st.write("### Summary Report")
+    st.write(f"Total Emails Processed: {len(emails)}")
+    for status in ["Valid", "Invalid", "Greylisted", "Blacklisted"]:
+        count = df[df["Status"] == status].shape[0]
+        st.write(f"{status} Emails: {count}")
+
+    # Export results
+    csv = df.to_csv(index=False)
+    st.download_button("Download Results", data=csv, file_name="email_validation_results.csv", mime="text/csv")
